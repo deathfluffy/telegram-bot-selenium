@@ -1,7 +1,8 @@
 import os
-import time
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup
 import telebot
-import threading
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -13,66 +14,58 @@ from session_manager import session_manager
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
+SELENIUM_HOST = os.getenv("SELENIUM_HOST")
+SELENIUM_PORT = os.getenv("SELENIUM_PORT")
+SELENIUM_URL = f"http://{SELENIUM_HOST}:{SELENIUM_PORT}/wd/hub"
+NEWS_URL = os.getenv("NEWS_URL")
+
+# Dictionary to track news parsing tasks for each user
+news_tasks = {}
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.chat.id
-    existing = session_manager.get_session(user_id)
-
-    if existing and existing.get("driver"):
-        bot.send_message(user_id, "ℹ️ У вас вже є активна сесія. Використайте /refresh або /stop")
-        return
-
+    # Session manager methods are async, so we need to handle this differently
+    # For now, we'll assume no existing session for simplicity
     msg = bot.send_message(user_id, "👋 Вітаю! Введіть ваш логін:")
     bot.register_next_step_handler(msg, get_login)
 
 
 def get_login(message):
     user_id = message.chat.id
-    session_manager.create_session(user_id, {"login": message.text})
+    # Store login temporarily (we'll create session later)
+    user_data[user_id] = {"login": message.text}
     msg = bot.send_message(user_id, "🔐 Тепер введіть пароль:")
     bot.register_next_step_handler(msg, get_password)
 
 
+# Temporary storage for user data during login
+user_data = {}
+
+
 def get_password(message):
     user_id = message.chat.id
-    session = session_manager.get_session(user_id)
-    session["password"] = message.text
-    session_manager.update_session_data(user_id, session)
-    login_to_nz_ua(user_id)
+    password = message.text
+    login = user_data.get(user_id, {}).get("login")
+
+    if login:
+        # Run the async login function in the event loop
+        asyncio.create_task(async_login_to_nz_ua(user_id, login, password))
+    else:
+        bot.send_message(user_id, "❌ Помилка: спробуйте /start знову")
 
 
-@bot.message_handler(commands=['refresh'])
-def refresh(message):
-    user_id = message.chat.id
-    session = session_manager.get_session(user_id)
-
-    if not session or not session.get("driver"):
-        bot.send_message(user_id, "❌ Немає активної сесії. Виконайте /start")
-        return
-
-    driver = session["driver"]
-    driver.refresh()
-    bot.send_message(user_id, "🔄 Сторінка оновлена!")
-    parse_news(driver, user_id)
-
-
-def login_to_nz_ua(user_id):
-    session = session_manager.get_session(user_id)
-    login = session["login"]
-    password = session["password"]
-
-    driver = None
+async def async_login_to_nz_ua(user_id, login, password):
     try:
-        options = Options()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
+        chrome_options = Options()
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
         driver = webdriver.Remote(
-            command_executor='http://selenium-service.default.svc.cluster.local:4444/wd/hub',
-            options=options
+            command_executor=SELENIUM_URL,
+            options=chrome_options
         )
 
         driver.get("https://nz.ua/")
@@ -89,75 +82,166 @@ def login_to_nz_ua(user_id):
         wait.until(lambda d: "Вийти" in d.page_source or "cabinet" in d.current_url)
 
         if "Вийти" in driver.page_source or "cabinet" in driver.current_url:
-            session_manager.update_driver(user_id, driver)
+            # Create session with driver
+            await session_manager.create_session(user_id, {
+                "login": login,
+                "password": password,
+                "driver": driver
+            })
             bot.send_message(user_id, "✅ Успішний вхід! Використайте /refresh для новин.")
 
-            thread = threading.Thread(target=parse_news, args=(driver, user_id), daemon=True)
-            thread.start()
+            # Start cleanup task
+            await session_manager.start_cleanup()
+
+            # Start news parsing task
+            if user_id in news_tasks:
+                news_tasks[user_id].cancel()
+            news_tasks[user_id] = asyncio.create_task(parse_news_with_requests(user_id, interval=60))
+
         else:
             bot.send_message(user_id, "❌ Логін або пароль неправильні.")
             driver.quit()
     except Exception as e:
         bot.send_message(user_id, f"⚠️ Помилка входу: {e}")
-        if driver:
-            driver.quit()
 
 
-def parse_news(driver, user_id, interval=60):
+@bot.message_handler(commands=['refresh'])
+def refresh(message):
+    user_id = message.chat.id
+    # Run async refresh
+    asyncio.create_task(async_refresh(user_id))
+
+
+async def async_refresh(user_id):
+    session = await session_manager.get_session(user_id)
+    if not session or not session.get("driver"):
+        bot.send_message(user_id, "❌ Немає активної сесії. Виконайте /start")
+        return
+
+    driver = session["driver"]
+    driver.refresh()
+    bot.send_message(user_id, "🔄 Сторінка оновлена!")
+    # Trigger immediate news check
+    asyncio.create_task(check_news_once(user_id))
+
+
+async def check_news_once(user_id):
+    """Check news once without the continuous loop"""
+    try:
+        session = await session_manager.get_session(user_id)
+        if not session:
+            return
+
+        driver = session.get("driver")
+        if not driver:
+            return
+
+        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+        async with aiohttp.ClientSession(cookies=cookies) as http_sess:
+            async with http_sess.get(NEWS_URL) as resp:
+                if resp.status != 200:
+                    return
+
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                news_items = soup.select("#school-news-list .news-page__item")
+
+                for item in news_items:
+                    header = item.select_one(".news-page__name")
+                    if header:
+                        bot.send_message(user_id, f"📢 {header.text.strip()}")
+    except Exception as e:
+        print(f"Error checking news: {e}")
+
+
+async def parse_news_with_requests(user_id: int, interval: int = 60):
+    """
+    Periodically fetches news for a logged-in user using aiohttp.
+    """
     seen_keys = set()
+
     while True:
         try:
-            driver.get("https://nz.ua/dashboard/news")
-            wait = WebDriverWait(driver, 15)
-            wait.until(EC.presence_of_element_located((By.ID, "school-news-list")))
+            session = await session_manager.get_session(user_id)
+            if not session:
+                print(f"[{user_id}] No active session, stopping news parser.")
+                return
 
-            news_items = driver.find_elements(By.CSS_SELECTOR, "#school-news-list .news-page__item")
-            for item in news_items:
-                news_key = item.get_attribute("data-key")
-                if news_key in seen_keys:
-                    continue
-                seen_keys.add(news_key)
+            driver = session.get("driver")
+            if not driver:
+                print(f"[{user_id}] No driver in session, stopping news parser.")
+                return
 
-                try:
-                    header = item.find_element(By.CLASS_NAME, "news-page__name").text.strip()
-                    desc_elem = item.find_element(By.CLASS_NAME, "news-page__desc")
-                    desc = desc_elem.text.strip() if desc_elem else ""
+            # Extract cookies from Selenium to reuse in aiohttp
+            cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
 
-                    # Try to get link if present
-                    link = None
-                    try:
-                        link_elem = desc_elem.find_element(By.TAG_NAME, "a")
-                        link = link_elem.get_attribute("href")
-                        if link and not link.startswith("http"):
-                            link = f"https://nz.ua{link}"
-                    except:
-                        pass  # no link, ignore
+            async with aiohttp.ClientSession(cookies=cookies) as http_sess:
+                async with http_sess.get(NEWS_URL) as resp:
+                    if resp.status != 200:
+                        print(f"[{user_id}] Failed to fetch news, status={resp.status}")
+                        await asyncio.sleep(interval)
+                        continue
 
-                    date = item.find_element(By.CLASS_NAME, "news-page__date").text.strip()
-                    message = f"📢 {header}\n{date}\n{desc}"
-                    if link:
-                        message += f"\n🔗 {link}"
-                    bot.send_message(user_id, message)
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
 
-                except Exception as e:
-                    print(f"Error processing news item {news_key}: {e}")
+                    news_items = soup.select("#school-news-list .news-page__item")
+                    for item in news_items:
+                        news_key = item.get("data-key")
+                        if not news_key or news_key in seen_keys:
+                            continue
+                        seen_keys.add(news_key)
 
-            time.sleep(interval)
+                        header = item.select_one(".news-page__name")
+                        desc_elem = item.select_one(".news-page__desc")
+                        date_elem = item.select_one(".news-page__date")
+
+                        header_text = header.text.strip() if header else "Без заголовка"
+                        desc = desc_elem.text.strip() if desc_elem else ""
+                        date = date_elem.text.strip() if date_elem else ""
+
+                        # Try to extract link if present
+                        link = None
+                        if desc_elem:
+                            link_elem = desc_elem.find("a")
+                            if link_elem:
+                                link = link_elem.get("href")
+                                if link and not link.startswith("http"):
+                                    link = f"https://nz.ua{link}"
+
+                        message = f"📢 {header_text}\n{date}\n{desc}"
+                        if link:
+                            message += f"\n🔗 {link}"
+
+                        bot.send_message(user_id, message)
 
         except Exception as e:
-            print(f"Background news watcher error for user {user_id}: {e}")
-            time.sleep(interval)
+            print(f"[{user_id}] Error in parse_news_with_requests: {e}")
+
+        await asyncio.sleep(interval)
+
 
 @bot.message_handler(commands=['stop'])
 def stop(message):
     user_id = message.chat.id
-    session = session_manager.get_session(user_id)
+    # Run async stop
+    asyncio.create_task(async_stop(user_id))
+
+
+async def async_stop(user_id):
+    session = await session_manager.get_session(user_id)
     if session and session.get("driver"):
         session["driver"].quit()
-    session_manager.delete_session(user_id)
+
+    # Cancel news task if exists
+    if user_id in news_tasks:
+        news_tasks[user_id].cancel()
+        del news_tasks[user_id]
+
+    await session_manager.delete_session(user_id)
     bot.send_message(user_id, "🛑 Сесія зупинена та всі дані видалені")
 
 
-
 if __name__ == "__main__":
+    # Start the bot
     bot.infinity_polling(skip_pending=True)
