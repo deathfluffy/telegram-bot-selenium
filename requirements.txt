@@ -1,0 +1,4 @@
+pyTelegramBotAPI==4.23.0
+selenium==4.25.0
+pycryptodome==3.21.0
+python-dotenv==1.0.1

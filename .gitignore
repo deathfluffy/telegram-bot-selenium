@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+bridge/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# Docker
+docker-compose.override.yml
+*.db
+*.sqlite3
+
+# Selenium / temporary files
+selenium-debug.log
+screenshots/
+tmp/
+
+# VS Code / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+

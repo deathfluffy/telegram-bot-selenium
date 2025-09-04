@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  selenium:
+    image: selenium/standalone-chrome:nightly
+    container_name: selenium-standalone-chrome
+    ports:
+      - "4444:4444"
+    shm_size: '2gb'
+    networks:
+      - app-network
+
+  bot:
+    build: .
+    container_name: telegram-bot
+    depends_on:
+      - selenium
+    env_file:
+      - .env
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
